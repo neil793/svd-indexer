@@ -64,11 +64,12 @@ class QdrantStore:
         return {
             "score": float(pt.score) if pt.score is not None else 0.0,
             "source_id": payload.get("source_id"),
+            "type": payload.get("type"), 
             "peripheral": payload.get("peripheral"),
             "register": payload.get("register"),
             "address": payload.get("address"),
             "text": payload.get("text", ""),
-            "metadata": payload,  # keep full payload for debug/LLM grounding
+            "metadata": payload,  
         }
 
     # ---------------------------

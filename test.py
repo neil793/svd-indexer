@@ -102,12 +102,10 @@ TEST_CASES = [
 
 
 def check_result(result: Dict[str, Any], test: Dict[str, Any]) -> bool:
-    """Check if result matches test expectations."""
     peripheral = (result.get("peripheral") or "").upper()
-    register = (result.get("register") or "").upper()
+    text = (result.get("text") or "").upper()
     
-    expected_periph = test["peripheral"].upper()
-    if expected_periph not in peripheral:
+    if test["peripheral"].upper() not in peripheral:
         return False
     
     if "exclude_peripherals" in test:
@@ -115,8 +113,9 @@ def check_result(result: Dict[str, Any], test: Dict[str, Any]) -> bool:
             if excluded.upper() in peripheral:
                 return False
     
+    # Check if register appears in chunk text
     for acceptable_reg in test["registers"]:
-        if acceptable_reg.upper() in register:
+        if acceptable_reg.upper() in text:
             return True
     
     return False
@@ -246,7 +245,7 @@ def run_tests(use_reranker: bool = False, verbose: bool = False, use_llm: bool =
             print(f"❌ FAIL: {test['query']}")
             print(f"📍 Expected: {test['peripheral']}/{test['registers'][0]}")
             print(f"{'=' * 80}")
-            print(f"   Got: {top_result['peripheral']}/{top_result['register']}{rank_info}")
+            print(f"   Got: {top_result['peripheral']}{rank_info}")
             print(f"   Score: {top_result['score']:.6f}")
             
             # Show top 5 results
@@ -255,7 +254,7 @@ def run_tests(use_reranker: bool = False, verbose: bool = False, use_llm: bool =
                 marker = "👈" if i == 1 else "  "
                 is_match = check_result(r, test)
                 match_symbol = "✅" if is_match else ""
-                print(f"   {marker} {i}. {r['peripheral']}/{r['register']} (score: {r['score']:.6f}) {match_symbol}")
+                print(f"   {marker} {i}. {r['peripheral']} (score: {r['score']:.6f}) {match_symbol}")
                 
                 # Show debug info if available
                 debug = r.get("metadata", {}).get("_debug", {})

@@ -19,7 +19,8 @@ from .parser import parse_multiple_svd_files
 from .chunker import create_chunks
 from .embedder import Embedder
 from .indexer import VectorIndexer
-from .deduplicator import deduplicate_registers
+# Deduplicator import removed - not using it anymore
+# from .deduplicator import deduplicate_registers
 
 
 def find_svd_files(directory: str) -> List[str]:
@@ -87,7 +88,7 @@ Examples:
     print("=" * 70)
 
     # Step 1: Parse SVD files
-    print("\n[1/5] Parsing SVD files...")
+    print("\n[1/4] Parsing SVD files...")
     print("-" * 70)
     registers = parse_multiple_svd_files(svd_files)
     print(f"\n✓ Parsed {len(registers)} registers total")
@@ -96,17 +97,16 @@ Examples:
         print("No registers found! Check your SVD files.")
         return
 
-    # Step 2: Deduplicate registers
-    print("\n[2/5] Deduplicating registers...")
+    # Step 2: DEDUPLICATION DISABLED
+    # Peripheral-level chunking already reduces redundancy significantly
+    # Deduplication was creating monster peripherals with 1000+ registers
+    print("\n[2/4] Skipping deduplication (disabled)...")
     print("-" * 70)
-    registers = deduplicate_registers(registers)
-
-    if not registers:
-        print("No registers remaining after deduplication.")
-        return
+    print("✓ Using all registers without deduplication")
+    print("  (Peripheral chunking will handle redundancy)")
 
     # Step 3: Create searchable chunks
-    print("\n[3/5] Creating searchable chunks...")
+    print("\n[3/4] Creating searchable chunks...")
     print("-" * 70)
     chunks = create_chunks(registers)
     print(f"✓ Created {len(chunks)} text chunks")
@@ -121,7 +121,7 @@ Examples:
     print(f"  Text: {chunks[0].text[:200]}...")
 
     # Step 4: Generate embeddings
-    print("\n[4/5] Generating embeddings...")
+    print("\n[4/4] Generating embeddings...")
     print("-" * 70)
     embedder = Embedder()
     embeddings = embedder.embed_chunks(chunks)

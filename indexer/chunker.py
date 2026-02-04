@@ -1,6 +1,10 @@
 """
 Create searchable text chunks from parsed SVD registers
-Improved for semantic retrieval + grounded LLM responses
+DUAL-LEVEL CHUNKING: Optimized for 512-token embedding models like all-MiniLM-L6-v2
+
+Strategy:
+- Summary chunks: ~300-400 chars (all register names, configuration hints)
+- Detail chunks: ~400 chars each (3-8 registers with full field details)
 """
 from typing import List, Dict, Any
 from collections import defaultdict
@@ -8,111 +12,314 @@ import hashlib
 from .models import ParsedRegister, TextChunk
 from .config import config
 
+# Token limits for all-MiniLM-L6-v2 (512 tokens max)
+MAX_SUMMARY_CHARS = 400  # ~512 tokens
+MAX_DETAIL_CHARS = 400   # ~512 tokens per detail chunk
 
-def create_chunk(register: ParsedRegister) -> TextChunk:
+
+def _group_registers_by_peripheral(registers: List[ParsedRegister]) -> Dict[str, List[ParsedRegister]]:
     """
-    One chunk per register with all field details.
-    Text is formatted to be embedding-friendly and to support grounded answers.
-    Includes deduplication metadata when available.
+    Group registers by their peripheral.
+    
+    Returns:
+        Dict mapping peripheral_key -> list of registers
+        Key format: "device/peripheral" or "peripheral" (if deduplicated)
     """
-    lines: List[str] = []
-
-    # Header context
-    if config.include_device:
-        lines.append(f"Device: {register.device}")
-        
-        # Show which devices this applies to (if deduplicated)
-        if hasattr(register, 'devices') and register.devices and len(register.devices) > 1:
-            device_list = ', '.join(register.devices[:5])
-            if len(register.devices) > 5:
-                device_list += f" (and {len(register.devices) - 5} more)"
-            lines.append(f"Applies to devices: {device_list}")
-
-    # Peripheral line
-    peripheral_line = f"Peripheral: {register.peripheral}"
-    if config.include_peripheral_desc and register.peripheral_description:
-        peripheral_line += f" — {register.peripheral_description}"
-    if register.peripheral_group:
-        peripheral_line += f" (Group: {register.peripheral_group})"
-    lines.append(peripheral_line)
+    groups = defaultdict(list)
     
-    # Show which peripheral instances (if deduplicated)
-    if hasattr(register, 'peripheral_instances') and register.peripheral_instances:
-        if len(register.peripheral_instances) > 1:
-            periph_list = ', '.join(register.peripheral_instances[:8])
-            if len(register.peripheral_instances) > 8:
-                periph_list += f" (and {len(register.peripheral_instances) - 8} more)"
-            lines.append(f"Peripheral instances: {periph_list}")
-
-    # Register line
-    reg_line = f"Register: {register.register}"
-    if config.include_register_desc and register.register_description:
-        reg_line += f" — {register.register_description}"
-    lines.append(reg_line)
-
-    # Address handling - show examples if deduplicated, otherwise show single address
-    if hasattr(register, 'address_map') and register.address_map and len(register.address_map) > 1:
-        lines.append("Example addresses:")
-        for key, addr in list(register.address_map.items())[:3]:
-            lines.append(f"  {key}: {addr}")
-        if len(register.address_map) > 3:
-            lines.append(f"  (and {len(register.address_map) - 3} more - see metadata)")
-    else:
-        lines.append(f"Address: {register.full_address}")
+    for reg in registers:
+        if hasattr(reg, 'devices') and reg.devices and len(reg.devices) > 1:
+            # Deduplicated - use peripheral name only
+            key = reg.peripheral
+        else:
+            # Device-specific
+            key = f"{reg.device}/{reg.peripheral}"
+        
+        groups[key].append(reg)
     
-    # Size and access
-    lines.append(f"Size: {register.size} bits")
-    if register.access:
-        lines.append(f"Access: {register.access}")
-    if register.reset_value:
-        lines.append(f"Reset value: {register.reset_value}")
+    return groups
 
-    # Fields
-    if config.include_field_names and register.fields:
-        lines.append("Fields:")
-        for field in register.fields:
-            desc = f" — {field.description}" if (config.include_field_desc and field.description) else ""
-            access_str = f" ({field.access})" if field.access else ""
-            lines.append(f"- {field.name} {field.bit_range}{access_str}{desc}")
 
-    text = "\n".join(lines)
-
-    # Enhanced metadata with deduplication info
-    metadata: Dict[str, Any] = {
-        "type": "register",
-        "device": register.device,
-        "peripheral": register.peripheral,
-        "peripheral_group": register.peripheral_group or "",
-        "register": register.register,
-        "address": register.full_address,
-        "size": int(register.size) if register.size is not None else 0,
-        "access": register.access or "",
-        "field_names": ", ".join([f.name for f in register.fields]) if register.fields else "",
-        
-        # Lexical search helpers
-        "peripheral_lower": (register.peripheral or "").lower(),
-        "register_lower": (register.register or "").lower(),
-        
-        # Deduplication metadata (critical for looking up specific addresses)
-        "devices": getattr(register, 'devices', [register.device]),
-        "peripheral_instances": getattr(register, 'peripheral_instances', [register.peripheral]),
-        "address_map": getattr(register, 'address_map', {
-            f"{register.device}/{register.peripheral}": register.full_address
-        }),
+def _categorize_registers(registers: List[ParsedRegister]) -> Dict[str, List[ParsedRegister]]:
+    """
+    Categorize registers by their likely function.
+    
+    Categories:
+    - Control: CR, CTL, CTRL registers
+    - Status: SR, STAT, STATUS registers  
+    - Data: DR, DATA, TX, RX registers
+    - Configuration: CFG, CONFIG registers
+    - Other: Everything else
+    """
+    categories = {
+        "control": [],
+        "status": [],
+        "data": [],
+        "configuration": [],
+        "other": []
     }
-
-    # Generate stable chunk ID using hash of dedup key components
-    # This prevents duplicate IDs when registers are deduplicated
-    id_components = [
-        register.peripheral_group or register.peripheral,
-        register.register,
-        ",".join(sorted([f"{f.name}@{f.bit_offset}:{f.bit_width}" for f in register.fields]))
-    ]
-    id_string = "|".join(id_components)
-    chunk_hash = hashlib.md5(id_string.encode()).hexdigest()[:12]
     
-    chunk_id = f"{register.peripheral}_{register.register}_{chunk_hash}"
+    for reg in registers:
+        reg_upper = reg.register.upper()
+        
+        if any(x in reg_upper for x in ["CR", "CTL", "CTRL"]):
+            categories["control"].append(reg)
+        elif any(x in reg_upper for x in ["SR", "STAT", "STATUS", "ISR", "FLAG"]):
+            categories["status"].append(reg)
+        elif any(x in reg_upper for x in ["DR", "DATA", "TX", "RX", "BUF"]):
+            categories["data"].append(reg)
+        elif any(x in reg_upper for x in ["CFG", "CONFIG", "CONF"]):
+            categories["configuration"].append(reg)
+        else:
+            categories["other"].append(reg)
+    
+    # Remove empty categories
+    return {k: v for k, v in categories.items() if v}
 
+
+def _format_register_detailed(register: ParsedRegister) -> str:
+    """Format a single register with full field details."""
+    lines = []
+    
+    # Register header
+    lines.append(f"\n{register.register}")
+    if register.register_description:
+        lines.append(f"  {register.register_description}")
+    
+    lines.append(f"  Address: {register.full_address}")
+    
+    if register.access:
+        lines.append(f"  Access: {register.access}")
+    if register.reset_value:
+        lines.append(f"  Reset: {register.reset_value}")
+    
+    # Fields (condensed)
+    if config.include_field_names and register.fields:
+        field_strs = []
+        for field in register.fields:
+            field_str = f"{field.name}{field.bit_range}"
+            if config.include_field_desc and field.description:
+                field_str += f" - {field.description}"
+            field_strs.append(field_str)
+        lines.append(f"  Fields: {', '.join(field_strs)}")
+    
+    return "\n".join(lines)
+
+
+def _get_configuration_hints(peripheral: str) -> str:
+    """Get configuration hints for a peripheral type"""
+    peripheral_upper = peripheral.upper()
+    
+    if "USART" in peripheral_upper or "UART" in peripheral_upper:
+        return ("Enable clock (RCC) → Configure baud rate (BRR) → "
+                "Enable TX/RX (CR1) → Enable UART (CR1.UE). "
+                "Key: CR1, DR, SR, BRR")
+    
+    elif "SPI" in peripheral_upper:
+        return ("Enable clock (RCC) → Configure mode/clock (CR1) → "
+                "Enable SPI (CR1.SPE) → Write to DR. "
+                "Key: CR1, CR2, DR, SR")
+    
+    elif "I2C" in peripheral_upper:
+        return ("Enable clock (RCC) → Configure timing (TIMINGR/CCR) → "
+                "Enable I2C (CR1.PE) → Generate START. "
+                "Key: CR1, CR2, SR1, SR2")
+    
+    elif "TIM" in peripheral_upper:
+        return ("Enable clock (RCC) → Set prescaler (PSC) → "
+                "Set auto-reload (ARR) → Enable counter (CR1.CEN). "
+                "PWM: Configure CCR → Set mode (CCMR) → Enable (CCER)")
+    
+    elif "GPIO" in peripheral_upper:
+        return ("Configure mode (MODER) → Set output (BSRR) → "
+                "Read input (IDR) → Pull-up/down (PUPDR)")
+    
+    elif "ADC" in peripheral_upper:
+        return ("Enable clock (RCC) → Configure channels (SQR) → "
+                "Start conversion (CR2.SWSTART) → Read result (DR)")
+    
+    elif "DMA" in peripheral_upper:
+        return ("Configure addresses (PAR/MAR) → Set count (NDTR) → "
+                "Configure mode (CCR) → Enable (CCR.EN)")
+    
+    elif "RCC" in peripheral_upper:
+        return "System clock configuration and peripheral clock enables"
+    
+    elif "PWR" in peripheral_upper:
+        return "Power control, low-power modes, voltage regulation"
+    
+    return f"{peripheral}: System peripheral"
+
+
+def create_peripheral_summary_chunk(
+    peripheral_key: str,
+    registers: List[ParsedRegister]
+) -> TextChunk:
+    """
+    Create a summary chunk for a peripheral (~300-400 chars, fits in 512 tokens).
+    
+    Optimized for broad queries like:
+    - "What registers does USART have?"
+    - "How do I configure SPI?"
+    - "What peripherals control timers?"
+    
+    Args:
+        peripheral_key: Key identifying the peripheral
+        registers: All registers for this peripheral
+        
+    Returns:
+        Summary TextChunk optimized for 512-token models
+    """
+    rep = registers[0]
+    lines = []
+    
+    # CRITICAL INFO FIRST (most important for search)
+    lines.append(f"Peripheral: {rep.peripheral}")
+    if config.include_peripheral_desc and rep.peripheral_description:
+        lines.append(f"Description: {rep.peripheral_description[:100]}")  # Truncate desc
+    
+    if config.include_device:
+        lines.append(f"Device: {rep.device}")
+    
+    # All register names (MOST CRITICAL - always include)
+    reg_names = sorted([r.register for r in registers])
+    lines.append(f"\nRegisters ({len(registers)}): {', '.join(reg_names)}")
+    
+    # Check if we're approaching limit
+    current_text = "\n".join(lines)
+    remaining_chars = MAX_SUMMARY_CHARS - len(current_text)
+    
+    # Only add more if we have space
+    if remaining_chars > 100:
+        # Categorized register list (condensed)
+        categories = _categorize_registers(registers)
+        for cat_name, cat_regs in categories.items():
+            cat_reg_names = sorted([r.register for r in cat_regs])
+            cat_line = f"{cat_name.title()}: {', '.join(cat_reg_names)}"
+            
+            # Check if adding this would exceed limit
+            if len(current_text) + len(cat_line) + 1 < MAX_SUMMARY_CHARS - 50:  # Leave 50 char buffer
+                lines.append(cat_line)
+                current_text = "\n".join(lines)
+            else:
+                break  # Stop adding categories
+    
+    # Check remaining space for fields
+    remaining_chars = MAX_SUMMARY_CHARS - len(current_text)
+    if remaining_chars > 80:
+        # Add some field names
+        all_fields = set()
+        for reg in registers:
+            all_fields.update([f.name for f in reg.fields])
+        
+        if all_fields:
+            # Only include as many fields as fit
+            field_list = sorted(all_fields)
+            field_str = ', '.join(field_list)
+            
+            # Truncate field list if too long
+            max_field_len = remaining_chars - 20  # "Common fields: " + buffer
+            if len(field_str) > max_field_len:
+                # Truncate and add ellipsis
+                field_str = field_str[:max_field_len-3] + "..."
+            
+            lines.append(f"\nCommon fields: {field_str}")
+            current_text = "\n".join(lines)
+    
+    # Configuration hints (only if space remains)
+    remaining_chars = MAX_SUMMARY_CHARS - len(current_text)
+    if remaining_chars > 60:
+        hints = _get_configuration_hints(rep.peripheral)
+        # Truncate hints if needed
+        if len(hints) > remaining_chars - 10:
+            hints = hints[:remaining_chars-13] + "..."
+        lines.append(f"\nConfig: {hints}")
+    
+    # Final text with hard limit enforcement
+    text = "\n".join(lines)
+    if len(text) > MAX_SUMMARY_CHARS:
+        text = text[:MAX_SUMMARY_CHARS-3] + "..."
+    
+    # Metadata (unchanged)
+    all_fields = set()
+    for reg in registers:
+        all_fields.update([f.name for f in reg.fields])
+    
+    metadata: Dict[str, Any] = {
+        "type": "peripheral_summary",
+        "device": rep.device,
+        "peripheral": rep.peripheral,
+        "peripheral_group": rep.peripheral_group or "",
+        "register_count": len(registers),
+        "registers": [r.register for r in registers],
+        "field_names": ", ".join(sorted(all_fields)),
+        "peripheral_lower": (rep.peripheral or "").lower(),
+        "devices": getattr(rep, 'devices', [rep.device]),
+        "peripheral_instances": getattr(rep, 'peripheral_instances', [rep.peripheral]),
+    }
+    
+    chunk_id = f"{rep.peripheral}_summary_{hashlib.md5(peripheral_key.encode()).hexdigest()[:8]}"
+    
+    return TextChunk(id=chunk_id, text=text, metadata=metadata)
+
+def _create_detail_chunk(
+    peripheral_key: str,
+    rep: ParsedRegister,
+    registers: List[ParsedRegister],
+    chunk_index: int
+) -> TextChunk:
+    """Helper to create a single detail chunk with size enforcement"""
+    lines = []
+    
+    # Minimal header (keep tokens for content)
+    lines.append(f"Peripheral: {rep.peripheral} (Detail {chunk_index + 1})")
+    lines.append(f"Device: {rep.device}")
+    
+    # Register list for this chunk
+    reg_names = [r.register for r in registers]
+    lines.append(f"Registers: {', '.join(reg_names)}\n")
+    
+    # Add registers one by one, checking size
+    current_text = "\n".join(lines)
+    
+    for reg in registers:
+        reg_text = _format_register_detailed(reg)
+        
+        # Check if adding this register would exceed limit
+        if len(current_text) + len(reg_text) + 1 < MAX_DETAIL_CHARS:
+            lines.append(reg_text)
+            current_text = "\n".join(lines)
+        else:
+            # This register would exceed limit, stop here
+            lines.append("\n[Additional registers truncated to fit 512 token limit]")
+            break
+    
+    # Final text with hard limit
+    text = "\n".join(lines)
+    if len(text) > MAX_DETAIL_CHARS:
+        text = text[:MAX_DETAIL_CHARS-3] + "..."
+    
+    # Collect field names for this chunk
+    all_fields = set()
+    for reg in registers:
+        all_fields.update([f.name for f in reg.fields])
+    
+    metadata: Dict[str, Any] = {
+        "type": "peripheral_detail",
+        "device": rep.device,
+        "peripheral": rep.peripheral,
+        "peripheral_group": rep.peripheral_group or "",
+        "chunk_part": chunk_index + 1,
+        "register_count": len(registers),
+        "registers": [r.register for r in registers],
+        "field_names": ", ".join(sorted(all_fields)),
+        "peripheral_lower": (rep.peripheral or "").lower(),
+        "devices": getattr(rep, 'devices', [rep.device]),
+        "peripheral_instances": getattr(rep, 'peripheral_instances', [rep.peripheral]),
+    }
+    
+    chunk_id = f"{rep.peripheral}_detail_{chunk_index}_{hashlib.md5(peripheral_key.encode()).hexdigest()[:8]}"
+    
     return TextChunk(id=chunk_id, text=text, metadata=metadata)
 
 
@@ -242,11 +449,15 @@ def create_device_summary_chunks(registers: List[ParsedRegister]) -> List[TextCh
 
 def create_chunks(registers: List[ParsedRegister]) -> List[TextChunk]:
     """
-    Create text chunks from all registers
+    Create dual-level chunks from all registers.
     
-    Creates two types of chunks:
-    1. Register-level chunks (one per unique register)
-    2. Device summary chunks (one per device)
+    For each peripheral, creates:
+    1. ONE summary chunk (~400 chars) with all register names and config hints
+    2. MULTIPLE detail chunks (~400 chars each) with full register/field details
+    
+    Plus one device summary chunk per device.
+    
+    This strategy is optimized for 512-token embedding models like all-MiniLM-L6-v2.
     
     Args:
         registers: List of parsed (and possibly deduplicated) registers
@@ -254,44 +465,48 @@ def create_chunks(registers: List[ParsedRegister]) -> List[TextChunk]:
     Returns:
         List of all text chunks ready for embedding
     """
-    chunks: List[TextChunk] = []
-    chunk_id_set = set()
-    duplicate_count = 0
-
-    # Create register-level chunks
-    for register in registers:
+    # Group registers by peripheral
+    peripheral_groups = _group_registers_by_peripheral(registers)
+    
+    print(f"\nCreating dual-level chunks (optimized for 512-token models)...")
+    print(f"  Found {len(peripheral_groups)} unique peripherals")
+    
+    chunks = []
+    summary_count = 0
+    detail_count = 0
+    
+    for peripheral_key, periph_registers in peripheral_groups.items():
         try:
-            chunk = create_chunk(register)
-
-            # Check for duplicate IDs (shouldn't happen with hash-based IDs, but just in case)
-            if chunk.id in chunk_id_set:
-                duplicate_count += 1
-                # Make unique by appending counter
-                chunk.id = f"{chunk.id}_dup{duplicate_count}"
-                print(f"⚠️  Duplicate chunk ID detected: {chunk.id}")
-            else:
-                chunk_id_set.add(chunk.id)
-
-            chunks.append(chunk)
-
+            # Create 1 summary chunk per peripheral
+            summary_chunk = create_peripheral_summary_chunk(peripheral_key, periph_registers)
+            chunks.append(summary_chunk)
+            summary_count += 1
+            
+            # Create multiple detail chunks per peripheral
+            detail_chunks = create_peripheral_detail_chunks(peripheral_key, periph_registers)
+            chunks.extend(detail_chunks)
+            detail_count += len(detail_chunks)
+            
+            # Show sample for first few
+            if summary_count <= 3:
+                print(f"  ✓ {peripheral_key}: 1 summary + {len(detail_chunks)} detail chunks ({len(periph_registers)} registers)")
+        
         except Exception as e:
-            device_id = getattr(register, 'device', 'unknown')
-            periph_id = getattr(register, 'peripheral', 'unknown')
-            reg_id = getattr(register, 'register', 'unknown')
-            print(f"⚠️  Failed to create chunk for {device_id}/{periph_id}/{reg_id}: {e}")
-
-    # Report register chunk status
-    print(f"\n✓ Created {len(chunks)} register-level chunks")
-    if duplicate_count > 0:
-        print(f"⚠️  Fixed {duplicate_count} duplicate chunk IDs")
+            print(f"  ⚠️  Failed to create chunks for {peripheral_key}: {e}")
+    
+    print(f"\n✓ Created {len(chunks)} peripheral chunks")
+    print(f"  ({summary_count} summaries + {detail_count} details)")
     
     # Create device summary chunks
     print("\nCreating device summary chunks...")
-    summary_chunks = create_device_summary_chunks(registers)
-    chunks.extend(summary_chunks)
-    print(f"✓ Created {len(summary_chunks)} device summary chunks")
+    device_chunks = create_device_summary_chunks(registers)
+    chunks.extend(device_chunks)
+    print(f"✓ Created {len(device_chunks)} device summary chunks")
     
     # Final summary
-    print(f"\n✓ Total: {len(chunks)} chunks ({len(chunks) - len(summary_chunks)} register-level + {len(summary_chunks)} device summaries)")
+    print(f"\n✓ Total: {len(chunks)} chunks")
+    print(f"  - {summary_count} peripheral summaries")
+    print(f"  - {detail_count} peripheral details")
+    print(f"  - {len(device_chunks)} device summaries")
     
     return chunks
