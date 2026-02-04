@@ -262,6 +262,7 @@ def create_peripheral_summary_chunk(
     
     return TextChunk(id=chunk_id, text=text, metadata=metadata)
 
+
 def _create_detail_chunk(
     peripheral_key: str,
     rep: ParsedRegister,
@@ -324,51 +325,49 @@ def _create_detail_chunk(
 
 
 def create_device_summary_chunks(registers: List[ParsedRegister]) -> List[TextChunk]:
-    """
-    Create summary chunks for each device listing available peripherals
-    
-    Enables queries like:
-    - "What timers are available on STM32F030?"
-    - "Does STM32F407 have USB?"
-    - "List all peripherals on device X"
-    
-    Args:
-        registers: List of parsed registers (possibly deduplicated)
-        
-    Returns:
-        List of device summary chunks (one per device)
-    """
     # Group peripherals by device
     device_peripherals = defaultdict(set)
     device_series = {}
-    
+
     for reg in registers:
         # Get actual device names (handle deduplication)
         if hasattr(reg, 'devices') and reg.devices:
             devices = reg.devices
         else:
             devices = [reg.device]
-        
+
         # Get peripheral instances (handle deduplication)
         if hasattr(reg, 'peripheral_instances') and reg.peripheral_instances:
             periphs = reg.peripheral_instances
         else:
             periphs = [reg.peripheral]
-        
+
         # Track which device has which peripherals
         for device in devices:
+            # -------------------------------
+            # FIX 1 (PART A): skip bad devices
+            # -------------------------------
+            if not device or device == "None":
+                continue
+
             for periph in periphs:
                 device_peripherals[device].add(periph)
-            
+
             # Store series info if available
             if hasattr(reg, 'device_series') and reg.device_series:
                 device_series[device] = reg.device_series
-    
+
     # Create one summary chunk per device
     summary_chunks = []
-    
+
     for device, peripherals in device_peripherals.items():
-        # Group peripherals by type for better organization
+        # --------------------------------
+        # FIX 1 (PART B): safety net skip
+        # --------------------------------
+        if not device or device == "None":
+            continue
+
+        # (rest of your existing code unchanged)
         timers = sorted([p for p in peripherals if p.startswith("TIM")])
         gpios = sorted([p for p in peripherals if p.startswith("GPIO")])
         uarts = sorted([p for p in peripherals if "UART" in p or "USART" in p])
@@ -379,20 +378,17 @@ def create_device_summary_chunks(registers: List[ParsedRegister]) -> List[TextCh
         dmas = sorted([p for p in peripherals if p.startswith("DMA")])
         usbs = sorted([p for p in peripherals if "USB" in p])
         cans = sorted([p for p in peripherals if "CAN" in p])
-        
-        # Collect "other" peripherals (system/misc)
+
         categorized = set(timers + gpios + uarts + spis + i2cs + adcs + dacs + dmas + usbs + cans)
         others = sorted([p for p in peripherals if p not in categorized])
-        
-        # Build text
+
         lines = [f"Device: {device}"]
-        
+
         if device in device_series:
             lines.append(f"Series: {device_series[device]}")
-        
+
         lines.append(f"\nAvailable Peripherals ({len(peripherals)} total):\n")
-        
-        # List each peripheral type
+
         if timers:
             lines.append(f"Timers ({len(timers)}): {', '.join(timers)}")
         if gpios:
@@ -413,20 +409,19 @@ def create_device_summary_chunks(registers: List[ParsedRegister]) -> List[TextCh
             lines.append(f"USB ({len(usbs)}): {', '.join(usbs)}")
         if cans:
             lines.append(f"CAN ({len(cans)}): {', '.join(cans)}")
-        
-        # List other peripherals at the end
+
         if others:
             lines.append(f"\nSystem/Other: {', '.join(others)}")
-        
+
         text = "\n".join(lines)
-        
-        # Create chunk with metadata
+
         chunk = TextChunk(
             id=f"device_summary_{device}",
             text=text,
             metadata={
                 "type": "device_summary",
                 "device": device,
+                "peripheral": " ".join(sorted(list(peripherals))),  # ← ADDED THIS LINE
                 "device_series": device_series.get(device, ""),
                 "peripheral_count": len(peripherals),
                 "peripherals": sorted(list(peripherals)),
@@ -441,10 +436,11 @@ def create_device_summary_chunks(registers: List[ParsedRegister]) -> List[TextCh
                 "cans": cans,
             }
         )
-        
+
         summary_chunks.append(chunk)
-    
+
     return summary_chunks
+
 
 
 def create_chunks(registers: List[ParsedRegister]) -> List[TextChunk]:
