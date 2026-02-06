@@ -11,7 +11,7 @@ from .reranker import CrossEncoderReranker
 TOKEN_RE = re.compile(r"[a-zA-Z0-9_]+")
 ADDR_RE = re.compile(r"\b0x[0-9a-fA-F]+\b")
 REG_HINT_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,15}$")
-
+ 
 # canonical peripheral families triggered by query tokens
 PERIPH_TRIGGERS = {
     "uart": ["UART", "USART"],
@@ -20,8 +20,6 @@ PERIPH_TRIGGERS = {
     "dma": ["DMA"],
     "spi": ["SPI"],
     "i2c": ["I2C"],
-    "tim": ["TIM"],
-    "rcc": ["RCC"],
     "adc": ["ADC"],
     "dac": ["DAC"],
     "can": ["CAN"],
@@ -46,26 +44,7 @@ def preprocess_query(query: str) -> Dict[str, Any]:
     for tok in TOKEN_RE.findall(raw):
         if REG_HINT_RE.match(tok):
             register_hints.add(tok)
-
-    # Track negative peripheral hints (peripherals to penalize)
-    peripheral_penalties = set()
     
-    # If query says "DMA" but NOT "USB", penalize USB-related DMA
-    if "dma" in tokset and "usb" not in tokset:
-        peripheral_penalties.update(["OTG_FS", "OTG_HS", "OTG", "USB"])
-    
-    # If query says "timer" or "tim", penalize SysTick and Watchdogs
-    if any(t in tokset for t in ["timer", "tim"]) and "systick" not in tokset:
-        peripheral_penalties.update(["STK", "SYSTICK"])
-    
-    # If query says "timer" and mentions "prescaler", penalize watchdogs
-    if any(t in tokset for t in ["timer", "tim", "prescaler"]):
-        peripheral_penalties.update(["WWDG", "IWDG"])
-    
-    # If query mentions I2C, penalize USB I2C controllers
-    if "i2c" in tokset and "usb" not in tokset:
-        peripheral_penalties.update(["OTG_FS", "OTG_HS", "USB"])
-
     return {
         "raw": raw,
         "clean": clean,
@@ -73,17 +52,7 @@ def preprocess_query(query: str) -> Dict[str, Any]:
         "peripheral_hints": sorted(peripheral_hints),
         "register_hints": sorted(register_hints),
         "address_hints": address_hints,
-        "peripheral_penalties": sorted(peripheral_penalties),
     }
-
-
-def _periph_family(periph: str) -> str:
-    p = (periph or "").upper()
-    for fam in ["USART", "UART", "GPIO", "SPI", "I2C", "TIM", "RCC", "ADC", "DAC", "CAN", "USB", "OTG"]:
-        if p.startswith(fam):
-            return fam
-    return p
-
 
 def post_process(results: List[Dict[str, Any]], query_info: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
@@ -92,7 +61,6 @@ def post_process(results: List[Dict[str, Any]], query_info: Dict[str, Any]) -> L
     """
     q_periph = set(query_info["peripheral_hints"])
     q_regs = {r.upper() for r in query_info["register_hints"]}
-    q_penalties = set(query_info.get("peripheral_penalties", []))
 
     out: List[Dict[str, Any]] = []
 
@@ -102,32 +70,20 @@ def post_process(results: List[Dict[str, Any]], query_info: Dict[str, Any]) -> L
 
         peripheral = (r.get("peripheral") or payload.get("peripheral") or "")
         register = (r.get("register") or payload.get("register") or "")
-        peripheral_upper = peripheral.upper()
+        chunk_type = payload.get("type", "")
 
         # Track what boosts/penalties were applied
         peripheral_match = False
         register_match = False
-        peripheral_penalty = False
-
-        # Boost 1: Peripheral family match
-        if q_periph:
-            fam = _periph_family(peripheral)
-            if fam in q_periph:
-                score *= 1.5
-                peripheral_match = True
         
-        # Boost 2: Exact register name match (very strong signal)
+        # Boost 1: Exact register name match (very strong signal)
         if q_regs and register.upper() in q_regs:
             score *= 1.4
             register_match = True
 
-        # Penalty 1: Wrong peripheral family
-        if q_penalties:
-            for penalty_periph in q_penalties:
-                if peripheral_upper.startswith(penalty_periph):
-                    score *= 0.5
-                    peripheral_penalty = True
-                    break
+        # Penalty 0: Device summaries when querying specific peripheral/register
+        if chunk_type == "device_summary" and (q_periph or q_regs):
+            score *= 0.7
 
         rr = dict(r)
         rr["score"] = score
@@ -141,9 +97,7 @@ def post_process(results: List[Dict[str, Any]], query_info: Dict[str, Any]) -> L
                 "applied_boosts": {
                     "peripheral_match": peripheral_match,
                     "register_match": register_match,
-                    "peripheral_penalty": peripheral_penalty,
                 },
-                "peripheral_penalties_active": sorted(q_penalties) if q_penalties else [],
             },
         }
         out.append(rr)
@@ -186,48 +140,6 @@ class HybridRetriever:
         if use_reranker:
             self.reranker = CrossEncoderReranker()
 
-    def _apply_post_rerank_penalties(
-        self, 
-        results: List[Dict[str, Any]], 
-        query_info: Dict[str, Any]
-    ) -> List[Dict[str, Any]]:
-        """
-        Apply STRONG penalties after reranking to override bad reranker confidence.
-        
-        This is critical because the reranker can be 99%+ confident on wrong answers
-        due to semantic similarity (e.g., STK/VAL for "timer counter").
-        """
-        q_penalties = set(query_info.get("peripheral_penalties", []))
-        
-        if not q_penalties:
-            return results
-        
-        for r in results:
-            peripheral = (r.get("peripheral") or "").upper()
-            
-            # VERY STRONG penalty after reranking (must override 99%+ confidence)
-            for penalty_periph in q_penalties:
-                if peripheral.startswith(penalty_periph):
-                    # Save original score for debugging
-                    original_score = r["score"]
-                    
-                    # Apply aggressive penalty
-                    r["score"] *= 0.1  # 90% reduction
-                    
-                    # Update debug info
-                    metadata = r.get("metadata", {})
-                    debug = metadata.get("_debug", {})
-                    debug["post_rerank_penalty"] = True
-                    debug["pre_penalty_score"] = original_score
-                    debug["penalty_applied"] = penalty_periph
-                    metadata["_debug"] = debug
-                    r["metadata"] = metadata
-                    break
-        
-        # Re-sort after penalties
-        results.sort(key=lambda x: (-x["score"], x.get("source_id") or ""))
-        return results
-
     def search(
         self,
         query: str,
@@ -263,22 +175,20 @@ class HybridRetriever:
         
         # Step 3: Optional reranking
         if self.use_reranker and self.reranker:
-            # Rerank top N results
             reranked = self.reranker.rerank(
                 query=query,
                 results=boosted[:rerank_top_n],
-                top_k=top_k * 2,  # Get extra results before final penalties
+                top_k=top_k * 2,
                 combine_scores=True,
-                hybrid_weight=0.5,  # 50/50 balance
+                hybrid_weight=0.5,
                 rerank_weight=0.5
             )
             
-            # Step 4: Apply post-reranking penalties to override bad confidence
-            final = self._apply_post_rerank_penalties(reranked, qi)
-            return final[:top_k]
+            return reranked[:top_k]
+
         
         return boosted[:top_k]
-
+ 
 
 # Backwards-compatible function-style entry point
 def hybrid_search(

@@ -2,3 +2,5 @@ qdrant_data/
 qdrant_storage/
 .DS_Store
 **/.DS_Store
+__pycache__/
+*.pyc

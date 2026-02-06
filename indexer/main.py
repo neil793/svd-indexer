@@ -19,8 +19,7 @@ from .parser import parse_multiple_svd_files
 from .chunker import create_chunks
 from .embedder import Embedder
 from .indexer import VectorIndexer
-# Deduplicator import removed - not using it anymore
-# from .deduplicator import deduplicate_registers
+from .deduplicator import deduplicate_registers_exact, get_deduplication_stats
 
 
 def find_svd_files(directory: str) -> List[str]:
@@ -41,7 +40,6 @@ def find_svd_files(directory: str) -> List[str]:
 def main():
     """Run the complete SVD indexing pipeline"""
 
-    # Parse command line arguments
     parser = argparse.ArgumentParser(
         description="Index SVD files into Qdrant for semantic search",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -67,7 +65,6 @@ Examples:
     # Validate arguments
     if not args.svd and not args.svd_dir:
         parser.error("Must specify either --svd or --svd-dir")
-
     if args.svd and args.svd_dir:
         parser.error("Cannot specify both --svd and --svd-dir")
 
@@ -88,28 +85,33 @@ Examples:
     print("=" * 70)
 
     # Step 1: Parse SVD files
-    print("\n[1/4] Parsing SVD files...")
+    print("\n[1/5] Parsing SVD files...")
     print("-" * 70)
     registers = parse_multiple_svd_files(svd_files)
-    print(f"\n✓ Parsed {len(registers)} registers total")
+    print(f"\nOK Parsed {len(registers)} registers total")
 
     if not registers:
         print("No registers found! Check your SVD files.")
         return
 
-    # Step 2: DEDUPLICATION DISABLED
-    # Peripheral-level chunking already reduces redundancy significantly
-    # Deduplication was creating monster peripherals with 1000+ registers
-    print("\n[2/4] Skipping deduplication (disabled)...")
+    # Step 2: Deduplicate registers (SAFE: exact duplicates only)
+    # IMPORTANT: This should NOT collapse across devices.
+    print("\n[2/5] Deduplicating registers (exact duplicates only)...")
     print("-" * 70)
-    print("✓ Using all registers without deduplication")
-    print("  (Peripheral chunking will handle redundancy)")
+
+    deduplicated = deduplicate_registers_exact(registers)
+    stats = get_deduplication_stats(registers, deduplicated)
+
+    print(f"OK Deduplicated {stats['original_count']} -> {stats['deduplicated_count']} registers")
+    print(f"   Reduction: {stats['reduction_count']} registers ({stats['reduction_percent']:.1f}%)")
+
+    registers = deduplicated  # Use deduplicated registers for chunking
 
     # Step 3: Create searchable chunks
-    print("\n[3/4] Creating searchable chunks...")
+    print("\n[3/5] Creating searchable chunks...")
     print("-" * 70)
     chunks = create_chunks(registers)
-    print(f"✓ Created {len(chunks)} text chunks")
+    print(f"OK Created {len(chunks)} text chunks")
 
     if not chunks:
         print("No chunks created! Something went wrong.")
@@ -121,11 +123,11 @@ Examples:
     print(f"  Text: {chunks[0].text[:200]}...")
 
     # Step 4: Generate embeddings
-    print("\n[4/4] Generating embeddings...")
+    print("\n[4/5] Generating embeddings...")
     print("-" * 70)
     embedder = Embedder()
     embeddings = embedder.embed_chunks(chunks)
-    print(f"✓ Generated {len(embeddings)} embeddings ({embedder.get_dimension()}-dimensional)")
+    print(f"OK Generated {len(embeddings)} embeddings ({embedder.get_dimension()}-dimensional)")
 
     if not embeddings:
         print("No embeddings generated! Something went wrong.")
@@ -136,21 +138,19 @@ Examples:
     print("-" * 70)
     indexer = VectorIndexer()
 
-    # Clear existing data if requested
     if args.clear:
         indexer.clear_collection()
 
-    # Index the chunks
     indexer.index_chunks(chunks, embeddings)
 
     # Show final statistics
     print("\n" + "=" * 70)
     print("INDEXING COMPLETE!")
     print("=" * 70)
-    stats = indexer.get_stats()
-    print(f"Collection: {stats['collection_name']}")
-    print(f"Total documents: {stats['total_documents']}")
-    print(f"Qdrant: {stats['qdrant_url']}")
+    idx_stats = indexer.get_stats()
+    print(f"Collection: {idx_stats['collection_name']}")
+    print(f"Total documents: {idx_stats['total_documents']}")
+    print(f"Qdrant: {idx_stats['qdrant_url']}")
     print("\nYou can now search this data using the search service.")
     print("=" * 70)
 
